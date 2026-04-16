@@ -43,12 +43,12 @@ flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
 flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
 
-config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
+config_flags.DEFINE_config_file('agent', 'agents/nfql.py', lock_config=False)
 
 
 def main(_):
     # Set up logger.
-    exp_name = get_exp_name(FLAGS.seed)
+    exp_name = FLAGS.agent.agent_name + '_' + get_exp_name(FLAGS.seed) + '_' + FLAGS.env_name
     setup_wandb(project='fql', group=FLAGS.run_group, name=exp_name)
 
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
@@ -114,6 +114,7 @@ def main(_):
     done = True
     expl_metrics = dict()
     online_rng = jax.random.PRNGKey(FLAGS.seed)
+    is_offline_to_online = FLAGS.offline_steps > 0 and FLAGS.online_steps > 0
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         if i <= FLAGS.offline_steps:
             # Offline RL.
@@ -122,7 +123,7 @@ def main(_):
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
             else:
-                agent, update_info = agent.update(batch)
+                agent, update_info = agent.update(batch, **({'online': False} if config['agent_name'] == 'nfql' else {}))
         else:
             # Online fine-tuning.
             online_rng, key = jax.random.split(online_rng)
@@ -172,7 +173,7 @@ def main(_):
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
             else:
-                agent, update_info = agent.update(batch)
+                agent, update_info = agent.update(batch, **({'online': True} if config['agent_name'] == 'nfql' else {}))
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
@@ -212,7 +213,11 @@ def main(_):
             eval_logger.log(eval_metrics, step=i)
 
         # Save agent.
-        if i % FLAGS.save_interval == 0:
+        if is_offline_to_online and i == FLAGS.offline_steps:
+            # Always keep an explicit checkpoint right before entering online fine-tuning.
+            save_agent(agent, FLAGS.save_dir, i)
+
+        if i % FLAGS.save_interval == 0 and not (is_offline_to_online and i == FLAGS.offline_steps):
             save_agent(agent, FLAGS.save_dir, i)
 
     train_logger.close()
