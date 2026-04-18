@@ -105,12 +105,16 @@ class NFQL4Agent(flax.struct.PyTreeNode):
     def _masked_median(values, mask):
         """Median of `values[mask > 0]`. Non-masked positions are pushed to +inf
         so they sort to the tail and are ignored by the median index.
+
+        Robust to NaN/Inf in `values` (replaced with 0 before sorting) and to
+        an all-zero mask (returns 0 rather than the sort-artifact +inf).
         """
-        pushed = jnp.where(mask > 0, values, jnp.inf)
+        safe_values = jnp.where(jnp.isfinite(values), values, jnp.asarray(0.0))
+        pushed = jnp.where(mask > 0, safe_values, jnp.inf)
         sorted_vals = jnp.sort(pushed)
         n_valid = mask.sum().astype(jnp.int32)
         idx = jnp.clip(n_valid // 2, 0, values.shape[0] - 1)
-        return sorted_vals[idx]
+        return jnp.where(n_valid > 0, sorted_vals[idx], jnp.asarray(0.0))
 
     # ------------------------------------------------------------------
     # Actor loss — §3.4 / §3.5 / §3.6 / §3.7 / §3.8.
@@ -149,15 +153,29 @@ class NFQL4Agent(flax.struct.PyTreeNode):
 
         a_med = self._masked_median(a_local, mask_low)
         β_MAD = 1.4826 * self._masked_median(jnp.abs(a_local - a_med), mask_low)
-        β_MAD = jnp.maximum(β_MAD, 1e-6)
+        # Floor raised from 1e-6 → 1e-3: the old floor permits a_norm to hit
+        # O(1e6) when advantages are tightly clustered, which then overflows
+        # exp() below. 1e-3 is still well below any physically meaningful
+        # Q-scale and leaves the MAD normalization effectively intact when
+        # real signal exists.
+        β_MAD = jnp.maximum(β_MAD, 1e-3)
         a_norm = (a_local - a_med) / β_MAD
+        # Clamp to a robust-statistics range. MAD-normalized samples are
+        # essentially "sigmas"; anything past ±10 is a numerical artifact,
+        # not signal. This hard-caps the exp input.
+        a_norm = jnp.clip(a_norm, -10.0, 10.0)
 
-        # -------- §3.5: fixed τ + hard clip --------
+        # -------- §3.5: fixed τ + hard clip, log-sum-exp stabilized --------
         tau_w = self.config['tau_weight']
         w_max = self.config['w_max']
-        w_raw = jnp.exp(a_norm / tau_w)
-        # Normalize using the LOW-t subset mean (so high-t samples don't
-        # skew the denominator toward exp(-a_med/β_MAD/τ)).
+        logits = a_norm / tau_w
+        # Subtract the max over the LOW-t subset before exp. This is the
+        # standard LSE stabilization that NFQL₃'s _ess_targeted_weights
+        # had and NFQL₄ accidentally dropped along with the bisection.
+        logits_low = jnp.where(mask_low > 0, logits, -jnp.inf)
+        logit_max = jnp.max(logits_low)
+        logit_max = jnp.where(jnp.isfinite(logit_max), logit_max, jnp.asarray(0.0))
+        w_raw = jnp.exp(logits - logit_max)
         mean_low = jnp.sum(w_raw * mask_low) / mask_low_sum
         w_exp = w_raw / jnp.maximum(mean_low, 1e-8)
         w_exp = jnp.clip(w_exp, 0.0, w_max)
@@ -192,7 +210,11 @@ class NFQL4Agent(flax.struct.PyTreeNode):
         c_gate = gate_qn * gate_critic
 
         # -------- §3.8: final per-sample BC weight --------
-        bc_weights = 1.0 + c_gate * (w_exp - 1.0)
+        # Guard against 0 * inf = NaN when gate=0 (early training) and w_exp
+        # happens to be non-finite from an earlier numerical hiccup.
+        safe_w_exp = jnp.where(jnp.isfinite(w_exp), w_exp, 1.0)
+        bc_weights = 1.0 + c_gate * (safe_w_exp - 1.0)
+        bc_weights = jnp.where(jnp.isfinite(bc_weights), bc_weights, 1.0)
         bc_weights = jax.lax.stop_gradient(bc_weights)
 
         # -------- BC flow loss --------
@@ -414,18 +436,25 @@ class NFQL4Agent(flax.struct.PyTreeNode):
         # §3.1: Q_n gate uses the MARTINGALE loss, not the full loss.
         cur_gate_signal = noised_info['gate_signal']
         cur_var_q = noised_info['var_q']
-        new_noised_ema = jnp.where(uninitialised, cur_gate_signal,
-                                   decay * self.noised_loss_ema + (1 - decay) * cur_gate_signal)
-        new_var_q_ema = jnp.where(uninitialised, cur_var_q,
-                                  decay * self.var_q_ema + (1 - decay) * cur_var_q)
-
-        # Critic gate — unchanged from NFQL₃.
         cur_critic_loss = info['critic/critic_loss']
         cur_var_tq = info['critic/var_target_q']
-        new_critic_ema = jnp.where(uninitialised, cur_critic_loss,
-                                   decay * self.critic_loss_ema + (1 - decay) * cur_critic_loss)
-        new_var_tq_ema = jnp.where(uninitialised, cur_var_tq,
-                                   decay * self.var_tq_ema + (1 - decay) * cur_var_tq)
+
+        def _ema_step(prev, cur, fallback_if_first):
+            # On the first update, initialize to `cur` when finite, else to a
+            # safe fallback. On later steps, skip NaN/Inf updates so one bad
+            # batch can't poison the EMA permanently.
+            init_val = jnp.where(jnp.isfinite(cur), cur, fallback_if_first)
+            step_val = jnp.where(
+                jnp.isfinite(cur),
+                decay * prev + (1 - decay) * cur,
+                prev,
+            )
+            return jnp.where(uninitialised, init_val, step_val)
+
+        new_noised_ema = _ema_step(self.noised_loss_ema, cur_gate_signal, jnp.asarray(1.0))
+        new_var_q_ema = _ema_step(self.var_q_ema, cur_var_q, jnp.asarray(1.0))
+        new_critic_ema = _ema_step(self.critic_loss_ema, cur_critic_loss, jnp.asarray(1.0))
+        new_var_tq_ema = _ema_step(self.var_tq_ema, cur_var_tq, jnp.asarray(1.0))
 
         info['gate/noised_loss_ema'] = new_noised_ema           # EMA of L_martingale
         info['gate/var_q_ema'] = new_var_q_ema
