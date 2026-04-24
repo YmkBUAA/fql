@@ -48,7 +48,18 @@ config_flags.DEFINE_config_file('agent', 'agents/nfql.py', lock_config=False)
 
 def main(_):
     # Set up logger.
-    exp_name = FLAGS.agent.agent_name + '_' + get_exp_name(FLAGS.seed) + '_' + FLAGS.env_name
+    config = FLAGS.agent
+
+    def format_exp_value(value):
+        return str(value).replace('.', 'p')
+
+    exp_tags = []
+    if 'n_actor_time_samples' in config:
+        exp_tags.append(f"K{config['n_actor_time_samples']}")
+    if 'ess_target' in config:
+        exp_tags.append(f"ess{format_exp_value(config['ess_target'])}")
+    exp_suffix = '_' + '_'.join(exp_tags) if exp_tags else ''
+    exp_name = config.agent_name + exp_suffix + '_' + get_exp_name(FLAGS.seed) + '_' + FLAGS.env_name
     setup_wandb(project='fql', group=FLAGS.run_group, name=exp_name)
 
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
@@ -58,7 +69,6 @@ def main(_):
         json.dump(flag_dict, f)
 
     # Make environment and datasets.
-    config = FLAGS.agent
     env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack)
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
