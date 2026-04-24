@@ -123,7 +123,7 @@ def main(_):
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
             else:
-                agent, update_info = agent.update(batch, **({'online': False} if config['agent_name'] == 'nfql' else {}))
+                agent, update_info = agent.update(batch, **({'online': False} if config['agent_name'] in ('nfql', 'nfql_6', 'nfql_7') else {}))
         else:
             # Online fine-tuning.
             online_rng, key = jax.random.split(online_rng)
@@ -173,7 +173,7 @@ def main(_):
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
             else:
-                agent, update_info = agent.update(batch, **({'online': True} if config['agent_name'] == 'nfql' else {}))
+                agent, update_info = agent.update(batch, **({'online': True} if config['agent_name'] in ('nfql', 'nfql_6', 'nfql_7') else {}))
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
