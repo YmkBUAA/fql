@@ -1,4 +1,5 @@
 import copy
+import functools
 from typing import Any
 
 import flax
@@ -121,7 +122,7 @@ class FQLVAgent(flax.struct.PyTreeNode):
         ess_achieved = ess_over_b(log_tau)
         return w_norm, tau, ess_achieved
 
-    def actor_loss(self, batch, grad_params, rng):
+    def actor_loss(self, batch, grad_params, rng, online):
         """Compute the FQL actor loss."""
         batch_size, action_dim = batch['actions'].shape
         rng, x_rng, t_rng = jax.random.split(rng, 3)
@@ -163,7 +164,10 @@ class FQLVAgent(flax.struct.PyTreeNode):
         )
         gate_critic = jnp.where(critic_valid, gate_critic, jnp.asarray(0.0))
 
-        bc_weights = 1.0 + gate_critic * (w_exp - 1.0)
+        apply_weights = (not self.config['weighted_bc_online_only']) or online
+        weighting_active = jnp.asarray(1.0 if apply_weights else 0.0, dtype=jnp.float32)
+        gate_c = gate_critic * weighting_active
+        bc_weights = 1.0 + gate_c * (w_exp - 1.0)
         bc_weights = jax.lax.stop_gradient(bc_weights)
 
         obs_tail = batch['observations'].shape[1:]
@@ -218,6 +222,9 @@ class FQLVAgent(flax.struct.PyTreeNode):
             'tau_star': tau_star,
             'ess_achieved': ess_achieved,
             'gate_critic': gate_critic,
+            'gate_c': gate_c,
+            'online_phase': jnp.asarray(1.0 if online else 0.0, dtype=jnp.float32),
+            'weighting_active': weighting_active,
             'r2_critic': r2_critic,
             'bc_weight_mean': bc_weights.mean(),
             'bc_weight_max': bc_weights.max(),
@@ -226,8 +233,8 @@ class FQLVAgent(flax.struct.PyTreeNode):
             't_mean': t.mean(),
         }
 
-    @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    @functools.partial(jax.jit, static_argnames=('online',))
+    def total_loss(self, batch, grad_params, rng=None, online=False):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
@@ -238,7 +245,9 @@ class FQLVAgent(flax.struct.PyTreeNode):
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(
+            batch, grad_params, actor_rng, online=online
+        )
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
@@ -258,13 +267,13 @@ class FQLVAgent(flax.struct.PyTreeNode):
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
 
-    @jax.jit
-    def update(self, batch):
+    @functools.partial(jax.jit, static_argnames=('online',))
+    def update(self, batch, online=False):
         """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, online=online)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')
@@ -446,6 +455,7 @@ def get_config():
             n_v_samples=8,
             value_loss_weight=1.0,
             ess_target=0.7,
+            weighted_bc_online_only=False,  # If True, value weighting is active only during the online stage.
             r2_critic_target=0.5,
             gate_kappa_critic=0.05,
             gate_ema_decay=0.999,
