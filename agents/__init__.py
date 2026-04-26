@@ -1,5 +1,6 @@
 from agents.fql import FQLAgent
 from agents.fql_mt import FQLMTAgent
+from agents.fql_v import FQLVAgent
 from agents.ifql import IFQLAgent
 from agents.iql import IQLAgent
 from agents.nfql import NFQLAgent
@@ -15,6 +16,7 @@ from agents.sac import SACAgent
 agents = dict(
     fql=FQLAgent,
     fql_mt=FQLMTAgent,
+    fql_v=FQLVAgent,
     nfql=NFQLAgent,
     nfql_2=NFQL2Agent,
     nfql_3=NFQL3Agent,
