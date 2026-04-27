@@ -13,11 +13,26 @@ from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
 
 
-class FQLVAgent(flax.struct.PyTreeNode):
-    """FQL with value-advantage weighted BC.
+class FQLARAgent(flax.struct.PyTreeNode):
+    """FQL with Flow-Anchored Reweighted BC (FlowAR).
 
-    The BC flow loss is reweighted from the standard critic/value advantage
-    A(s, a) = Q(s, a) - V(s). There is no noised critic and no Q_n training.
+    The BC flow loss is reweighted by an ESS-targeted softmax of a flow-local
+    advantage:
+
+        a' = ODE(actor_bc_flow ; from (x_t = (1-t) eps + t a, t) to t = 1)
+        Delta(s, a; t) = Q_target(s, a) - Q_target(s, a')
+
+    Unlike fql_v which uses a global V(s) = E_{a' ~ pi}[Q] baseline, FlowAR's
+    baseline is sample-anchored: a' is the BC flow's local completion of a
+    after partial noising. The noise level t is a continuous knob between
+    full self-consistency (t -> 0, a' = a) and the BC marginal (t -> 1,
+    a' ~ BC(s)). The advantage signal vanishes when the BC flow already
+    reproduces a (offline-safe), and turns systematically positive when the
+    buffer contains best-of-n / improved actions that the BC flow would pull
+    back toward its mode (online-aware).
+
+    No V network and no Q_n network. Uses the existing actor_bc_flow itself
+    as the baseline generator.
     """
 
     rng: Any
@@ -27,7 +42,7 @@ class FQLVAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute the FQL critic loss."""
+        """Standard FQL critic loss; also returns var(target_q) for the R^2 gate."""
         rng, sample_rng = jax.random.split(rng)
         next_actions = self.sample_actions(batch['next_observations'], seed=sample_rng)
         next_actions = jnp.clip(next_actions, -1, 1)
@@ -51,44 +66,9 @@ class FQLVAgent(flax.struct.PyTreeNode):
             'q_min': q.min(),
         }
 
-    def value_loss(self, batch, grad_params, rng):
-        """Train V(s) toward E_a[Q(s, a)] under the current BC flow policy."""
-        batch_size, action_dim = batch['actions'].shape
-        n = self.config['n_v_samples']
-
-        noises = jax.random.normal(rng, (batch_size, n, action_dim))
-        obs_tail = batch['observations'].shape[1:]
-        obs_exp = jnp.broadcast_to(
-            batch['observations'][:, None], (batch_size, n) + obs_tail
-        )
-        obs_flat = obs_exp.reshape((batch_size * n,) + obs_tail)
-        noises_flat = noises.reshape(batch_size * n, action_dim)
-
-        a_samples_flat = self.network.select('actor_onestep_flow')(obs_flat, noises_flat)
-        a_samples_flat = jnp.clip(a_samples_flat, -1, 1)
-        a_samples_flat = jax.lax.stop_gradient(a_samples_flat)
-
-        q_samples_flat = self.network.select('target_critic')(
-            obs_flat, actions=a_samples_flat
-        )
-        ensemble = q_samples_flat.shape[0]
-        q_samples = q_samples_flat.reshape(ensemble, batch_size, n)
-        v_target = jax.lax.stop_gradient(q_samples.mean(axis=(0, 2)))
-
-        v_pred = self.network.select('value')(
-            batch['observations'], params=grad_params
-        )
-
-        loss = jnp.mean((v_pred - v_target) ** 2)
-        return loss, {
-            'value_loss': loss,
-            'v_pred_mean': v_pred.mean(),
-            'v_target_mean': v_target.mean(),
-            'v_target_std': v_target.std(),
-        }
-
     @staticmethod
     def _ess_targeted_weights(a_norm, ess_target, n_iters=14):
+        """Bisect log(tau) so that ESS over the batch hits ess_target."""
         b = a_norm.shape[0]
 
         def ess_over_b(log_tau):
@@ -122,37 +102,79 @@ class FQLVAgent(flax.struct.PyTreeNode):
         ess_achieved = ess_over_b(log_tau)
         return w_norm, tau, ess_achieved
 
+    def _roll_flow_from(self, observations, x_t, t_start, n_steps):
+        """Integrate actor_bc_flow from (x_t, t_start) to t = 1.
+
+        Args:
+            observations: (B, *obs_dims).
+            x_t: (B, action_dim) flow state at t_start.
+            t_start: (B, 1) starting flow time in [0, 1).
+            n_steps: int Euler steps for the remaining (1 - t_start) interval.
+
+        Returns:
+            (B, action_dim) terminal flow state, clipped to [-1, 1].
+        """
+        if self.config['encoder'] is not None:
+            obs_enc = self.network.select('actor_bc_flow_encoder')(observations)
+        else:
+            obs_enc = observations
+        x = x_t
+        # Per-sample uniform step size (1 - t_start) / n_steps.
+        dt = (1.0 - t_start) / float(n_steps)
+        for i in range(n_steps):
+            tau = t_start + i * dt
+            vels = self.network.select('actor_bc_flow')(obs_enc, x, tau, is_encoded=True)
+            x = x + vels * dt
+        return jnp.clip(x, -1, 1)
+
     def actor_loss(self, batch, grad_params, rng, online):
-        """Compute the FQL actor loss."""
+        """FlowAR actor loss = Delta-weighted BC flow + distill + Q."""
         batch_size, action_dim = batch['actions'].shape
-        rng, x_rng, t_rng = jax.random.split(rng, 3)
-        k = self.config['n_actor_time_samples']
+        a = batch['actions']
 
-        # BC flow loss.
-        x_0 = jax.random.normal(x_rng, (batch_size, k, action_dim))
-        x_1 = batch['actions']
-        x_1_exp = x_1[:, None, :]
-        t = jax.random.uniform(t_rng, (batch_size, k, 1))
-        x_t = (1 - t) * x_0 + t * x_1_exp
-        vel = x_1_exp - x_0
-
-        original_qs = self.network.select('critic')(
-            batch['observations'], actions=batch['actions']
+        # ----- Branch A: advantage via self-denoise -------------------------
+        rng, eps_rng, t_rng = jax.random.split(rng, 3)
+        eps_adv = jax.random.normal(eps_rng, (batch_size, action_dim))
+        t_adv = jax.random.uniform(
+            t_rng, (batch_size, 1),
+            minval=self.config['adv_t_lo'],
+            maxval=self.config['adv_t_hi'],
         )
-        original_q = jax.lax.stop_gradient(original_qs.mean(axis=0))
-        v = self.network.select('value')(batch['observations'])
-        v = jax.lax.stop_gradient(v)
+        x_t_adv = (1.0 - t_adv) * eps_adv + t_adv * a
+        a_prime = self._roll_flow_from(
+            batch['observations'], x_t_adv, t_adv,
+            n_steps=self.config['adv_flow_steps'],
+        )
+        a_prime = jax.lax.stop_gradient(a_prime)
 
-        a_local = original_q - v
-        a_med = jnp.median(a_local)
-        beta_mad = 1.4826 * jnp.median(jnp.abs(a_local - a_med))
+        # Use target_critic for advantage (stable baseline).
+        q_a_all = self.network.select('target_critic')(
+            batch['observations'], actions=a
+        )
+        q_aprime_all = self.network.select('target_critic')(
+            batch['observations'], actions=a_prime
+        )
+        if self.config['q_agg'] == 'min':
+            q_a = q_a_all.min(axis=0)
+            q_aprime = q_aprime_all.min(axis=0)
+        else:
+            q_a = q_a_all.mean(axis=0)
+            q_aprime = q_aprime_all.mean(axis=0)
+
+        delta = jax.lax.stop_gradient(q_a - q_aprime)
+
+        # MAD-normalize across batch.
+        d_med = jnp.median(delta)
+        beta_mad = 1.4826 * jnp.median(jnp.abs(delta - d_med))
         beta_mad = jnp.maximum(beta_mad, 1e-6)
-        a_norm = (a_local - a_med) / beta_mad
+        d_norm = (delta - d_med) / beta_mad
 
+        # ESS-targeted softmax.
         w_exp, tau_star, ess_achieved = self._ess_targeted_weights(
-            a_norm, jnp.asarray(self.config['ess_target'])
+            d_norm, jnp.asarray(self.config['ess_target'])
         )
 
+        # Critic R^2 reliability gate.
         critic_valid = (self.critic_loss_ema >= 0) & (self.var_tq_ema > 0)
         r2_critic = jnp.where(
             critic_valid,
@@ -170,30 +192,42 @@ class FQLVAgent(flax.struct.PyTreeNode):
         bc_weights = 1.0 + gate_c * (w_exp - 1.0)
         bc_weights = jax.lax.stop_gradient(bc_weights)
 
+        # ----- Branch B: independently-sampled CFM BC loss, reweighted -----
+        rng, eps2_rng, t2_rng = jax.random.split(rng, 3)
+        k = self.config['n_actor_time_samples']
+        eps2 = jax.random.normal(eps2_rng, (batch_size, k, action_dim))
+        t2 = jax.random.uniform(t2_rng, (batch_size, k, 1))
+        a_exp = a[:, None, :]
+        x_t2 = (1.0 - t2) * eps2 + t2 * a_exp
+        target_vel = a_exp - eps2
+
         obs_tail = batch['observations'].shape[1:]
         obs_exp = jnp.broadcast_to(
             batch['observations'][:, None], (batch_size, k) + obs_tail
         )
         obs_flat = obs_exp.reshape((batch_size * k,) + obs_tail)
-        x_t_flat = x_t.reshape(batch_size * k, action_dim)
-        t_flat = t.reshape(batch_size * k, 1)
+        x_t2_flat = x_t2.reshape(batch_size * k, action_dim)
+        t2_flat = t2.reshape(batch_size * k, 1)
         pred_flat = self.network.select('actor_bc_flow')(
-            obs_flat, x_t_flat, t_flat, params=grad_params
+            obs_flat, x_t2_flat, t2_flat, params=grad_params
         )
         pred = pred_flat.reshape(batch_size, k, action_dim)
-        per_time_bc = jnp.mean((pred - vel) ** 2, axis=-1)
+        per_time_bc = jnp.mean((pred - target_vel) ** 2, axis=-1)
         bc_flow_loss = jnp.mean(bc_weights[:, None] * per_time_bc)
 
-        # Distillation loss.
+        # ----- Distillation + Q loss (unchanged from FQL) ------------------
         rng, noise_rng = jax.random.split(rng)
         noises = jax.random.normal(noise_rng, (batch_size, action_dim))
-        target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
-        actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
+        target_flow_actions = self.compute_flow_actions(
+            batch['observations'], noises=noises
+        )
+        actor_actions = self.network.select('actor_onestep_flow')(
+            batch['observations'], noises, params=grad_params
+        )
         distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
-        # Q loss.
-        actor_actions = jnp.clip(actor_actions, -1, 1)
-        qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
+        actor_actions_clip = jnp.clip(actor_actions, -1, 1)
+        qs = self.network.select('critic')(batch['observations'], actions=actor_actions_clip)
         q = jnp.mean(qs, axis=0)
 
         q_loss = -q.mean()
@@ -201,12 +235,13 @@ class FQLVAgent(flax.struct.PyTreeNode):
             lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
             q_loss = lam * q_loss
 
-        # Total loss.
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
-        # Additional metrics for logging.
+        # ----- Diagnostics --------------------------------------------------
         actions = self.sample_actions(batch['observations'], seed=rng)
         mse = jnp.mean((actions - batch['actions']) ** 2)
+        dist_a_aprime = jnp.linalg.norm(a - a_prime, axis=-1)
+        frac_a_better = jnp.mean((delta > 0).astype(jnp.float32))
 
         return actor_loss, {
             'actor_loss': actor_loss,
@@ -215,9 +250,14 @@ class FQLVAgent(flax.struct.PyTreeNode):
             'q_loss': q_loss,
             'q': q.mean(),
             'mse': mse,
-            'v': v.mean(),
-            'adv_mean': a_local.mean(),
-            'adv_std': a_local.std(),
+            'flowar/delta_mean': delta.mean(),
+            'flowar/delta_std': delta.std(),
+            'flowar/dist_a_aprime_mean': dist_a_aprime.mean(),
+            'flowar/dist_a_aprime_p50': jnp.median(dist_a_aprime),
+            'flowar/frac_a_better': frac_a_better,
+            'flowar/q_a_mean': q_a.mean(),
+            'flowar/q_aprime_mean': q_aprime.mean(),
+            'flowar/t_adv_mean': t_adv.mean(),
             'beta_mad': beta_mad,
             'tau_star': tau_star,
             'ess_achieved': ess_achieved,
@@ -227,19 +267,17 @@ class FQLVAgent(flax.struct.PyTreeNode):
             'weighting_active': weighting_active,
             'r2_critic': r2_critic,
             'bc_weight_mean': bc_weights.mean(),
+            'bc_weight_std': bc_weights.std(),
             'bc_weight_max': bc_weights.max(),
             'bc_weight_min': bc_weights.min(),
-            'n_actor_time_samples': jnp.asarray(k, dtype=jnp.float32),
-            't_mean': t.mean(),
         }
 
     @functools.partial(jax.jit, static_argnames=('online',))
     def total_loss(self, batch, grad_params, rng=None, online=False):
-        """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
 
-        rng, actor_rng, critic_rng, value_rng = jax.random.split(rng, 4)
+        rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
         critic_loss, critic_info = self.critic_loss(batch, grad_params, critic_rng)
         for k, v in critic_info.items():
@@ -251,15 +289,10 @@ class FQLVAgent(flax.struct.PyTreeNode):
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        v_loss, v_info = self.value_loss(batch, grad_params, value_rng)
-        for k, v in v_info.items():
-            info[f'value/{k}'] = v
-
-        loss = critic_loss + actor_loss + self.config['value_loss_weight'] * v_loss
+        loss = critic_loss + actor_loss
         return loss, info
 
     def target_update(self, network, module_name):
-        """Update the target network."""
         new_target_params = jax.tree_util.tree_map(
             lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
             self.network.params[f'modules_{module_name}'],
@@ -269,7 +302,6 @@ class FQLVAgent(flax.struct.PyTreeNode):
 
     @functools.partial(jax.jit, static_argnames=('online',))
     def update(self, batch, online=False):
-        """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
@@ -304,14 +336,8 @@ class FQLVAgent(flax.struct.PyTreeNode):
         ), info
 
     @jax.jit
-    def sample_actions(
-        self,
-        observations,
-        seed=None,
-        temperature=1.0,
-    ):
-        """Sample actions from the one-step policy."""
-        action_seed, noise_seed = jax.random.split(seed)
+    def sample_actions(self, observations, seed=None, temperature=1.0):
+        action_seed, _ = jax.random.split(seed)
         noises = jax.random.normal(
             action_seed,
             (
@@ -324,16 +350,10 @@ class FQLVAgent(flax.struct.PyTreeNode):
         return actions
 
     @jax.jit
-    def compute_flow_actions(
-        self,
-        observations,
-        noises,
-    ):
-        """Compute actions from the BC flow model using the Euler method."""
+    def compute_flow_actions(self, observations, noises):
         if self.config['encoder'] is not None:
             observations = self.network.select('actor_bc_flow_encoder')(observations)
         actions = noises
-        # Euler method.
         for i in range(self.config['flow_steps']):
             t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
             vels = self.network.select('actor_bc_flow')(observations, actions, t, is_encoded=True)
@@ -342,21 +362,7 @@ class FQLVAgent(flax.struct.PyTreeNode):
         return actions
 
     @classmethod
-    def create(
-        cls,
-        seed,
-        ex_observations,
-        ex_actions,
-        config,
-    ):
-        """Create a new agent.
-
-        Args:
-            seed: Random seed.
-            ex_observations: Example batch of observations.
-            ex_actions: Example batch of actions.
-            config: Configuration dictionary.
-        """
+    def create(cls, seed, ex_observations, ex_actions, config):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -364,27 +370,18 @@ class FQLVAgent(flax.struct.PyTreeNode):
         ob_dims = ex_observations.shape[1:]
         action_dim = ex_actions.shape[-1]
 
-        # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
             encoders['critic'] = encoder_module()
-            encoders['value'] = encoder_module()
             encoders['actor_bc_flow'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
 
-        # Define networks.
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             num_ensembles=2,
             encoder=encoders.get('critic'),
-        )
-        value_def = Value(
-            hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
-            num_ensembles=1,
-            encoder=encoders.get('value'),
         )
         actor_bc_flow_def = ActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
@@ -402,13 +399,13 @@ class FQLVAgent(flax.struct.PyTreeNode):
         network_info = dict(
             critic=(critic_def, (ex_observations, ex_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)),
-            value=(value_def, (ex_observations,)),
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, ex_actions, ex_times)),
             actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, ex_actions)),
         )
         if encoders.get('actor_bc_flow') is not None:
-            # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
-            network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))
+            network_info['actor_bc_flow_encoder'] = (
+                encoders.get('actor_bc_flow'), (ex_observations,)
+            )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -435,27 +432,32 @@ class FQLVAgent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='fql_v',  # Agent name.
-            ob_dims=ml_collections.config_dict.placeholder(list),  # Observation dimensions (will be set automatically).
-            action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
-            lr=3e-4,  # Learning rate.
-            batch_size=256,  # Batch size.
-            actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
-            value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions.
-            layer_norm=True,  # Whether to use layer normalization.
-            actor_layer_norm=False,  # Whether to use layer normalization for the actor.
-            discount=0.99,  # Discount factor.
-            tau=0.005,  # Target network update rate.
-            q_agg='mean',  # Aggregation method for target Q values.
-            alpha=10.0,  # BC coefficient (need to be tuned for each environment).
-            flow_steps=10,  # Number of flow steps.
-            normalize_q_loss=False,  # Whether to normalize the Q loss.
-            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
-            n_actor_time_samples=4,
-            n_v_samples=8,
-            value_loss_weight=1.0,
+            agent_name='fql_ar',
+            ob_dims=ml_collections.config_dict.placeholder(list),
+            action_dim=ml_collections.config_dict.placeholder(int),
+            lr=3e-4,
+            batch_size=256,
+            actor_hidden_dims=(512, 512, 512, 512),
+            value_hidden_dims=(512, 512, 512, 512),
+            layer_norm=True,
+            actor_layer_norm=False,
+            discount=0.99,
+            tau=0.005,
+            q_agg='mean',
+            alpha=10.0,
+            flow_steps=10,
+            normalize_q_loss=False,
+            encoder=ml_collections.config_dict.placeholder(str),
+            # ---- BC flow CFM samples per state (independent of advantage path) ----
+            n_actor_time_samples=1,
+            # ---- FlowAR advantage path ----
+            adv_t_lo=0.4,           # lower bound on noise level for advantage path
+            adv_t_hi=0.7,           # upper bound on noise level for advantage path
+            adv_flow_steps=3,       # Euler steps for partial denoising back to t=1
+            # ---- ESS-targeted reweighting ----
             ess_target=0.7,
-            weighted_bc_online_only=True,  # If True, value weighting is active only during the online stage.
+            weighted_bc_online_only=True,
+            # ---- Critic R^2 reliability gate ----
             r2_critic_target=0.5,
             gate_kappa_critic=0.05,
             gate_ema_decay=0.999,

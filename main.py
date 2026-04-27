@@ -45,6 +45,11 @@ flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling f
 
 config_flags.DEFINE_config_file('agent', 'agents/nfql.py', lock_config=False)
 
+# Agents whose `update` accepts an `online` kwarg to switch advantage-weighted
+# BC on/off across the offline→online boundary. Adding a new agent here is the
+# only place that needs touching.
+ONLINE_AWARE_AGENTS = ('fql_v', 'nfql', 'nfql_6', 'nfql_7', 'nfql_8', 'fql_ar')
+
 
 def main(_):
     # Set up logger.
@@ -133,7 +138,7 @@ def main(_):
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
             else:
-                agent, update_info = agent.update(batch, **({'online': False} if config['agent_name'] in ('nfql', 'nfql_6', 'nfql_7') else {}))
+                agent, update_info = agent.update(batch, **({'online': False} if config['agent_name'] in ONLINE_AWARE_AGENTS else {}))
         else:
             # Online fine-tuning.
             online_rng, key = jax.random.split(online_rng)
@@ -183,7 +188,7 @@ def main(_):
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
             else:
-                agent, update_info = agent.update(batch, **({'online': True} if config['agent_name'] in ('nfql', 'nfql_6', 'nfql_7') else {}))
+                agent, update_info = agent.update(batch, **({'online': True} if config['agent_name'] in ONLINE_AWARE_AGENTS else {}))
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
