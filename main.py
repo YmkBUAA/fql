@@ -48,7 +48,7 @@ config_flags.DEFINE_config_file('agent', 'agents/nfql.py', lock_config=False)
 # Agents whose `update` accepts an `online` kwarg to switch advantage-weighted
 # BC on/off across the offline→online boundary. Adding a new agent here is the
 # only place that needs touching.
-ONLINE_AWARE_AGENTS = ('fql_v', 'nfql', 'nfql_6', 'nfql_7', 'nfql_8', 'fql_ar')
+ONLINE_AWARE_AGENTS = ('fql_v', 'nfql', 'nfql_6', 'nfql_7', 'nfql_8', 'fql_ar', 'fql_pi')
 
 
 def main(_):
@@ -63,6 +63,13 @@ def main(_):
         exp_tags.append(f"K{config['n_actor_time_samples']}")
     if 'ess_target' in config:
         exp_tags.append(f"ess{format_exp_value(config['ess_target'])}")
+    if 'adv_t_lo' in config and 'adv_t_hi' in config:
+        lo = config['adv_t_lo']
+        hi = config['adv_t_hi']
+        if lo == hi:
+            exp_tags.append(f"t{format_exp_value(lo)}")
+        else:
+            exp_tags.append(f"t{format_exp_value(lo)}-{format_exp_value(hi)}")
     exp_suffix = '_' + '_'.join(exp_tags) if exp_tags else ''
     exp_name = config.agent_name + exp_suffix + '_' + get_exp_name(FLAGS.seed) + '_' + FLAGS.env_name
     setup_wandb(project='fql', group=FLAGS.run_group, name=exp_name)

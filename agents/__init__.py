@@ -2,6 +2,7 @@ from agents.fql import FQLAgent
 from agents.fql_mt import FQLMTAgent
 from agents.fql_v import FQLVAgent
 from agents.fql_ar import FQLARAgent
+from agents.fql_pi import FQLPIAgent
 from agents.ifql import IFQLAgent
 from agents.iql import IQLAgent
 from agents.nfql import NFQLAgent
@@ -20,6 +21,7 @@ agents = dict(
     fql_mt=FQLMTAgent,
     fql_v=FQLVAgent,
     fql_ar=FQLARAgent,
+    fql_pi=FQLPIAgent,
     nfql=NFQLAgent,
     nfql_2=NFQL2Agent,
     nfql_3=NFQL3Agent,
