@@ -58,29 +58,37 @@ class FQLAgent(flax.struct.PyTreeNode):
         pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
         bc_flow_loss = jnp.mean((pred - vel) ** 2)
 
-        # Distillation loss.
-        rng, noise_rng = jax.random.split(rng)
-        noises = jax.random.normal(noise_rng, (batch_size, action_dim))
-        target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
-        actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
-        distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+        if self.config['use_distill_head']:
+            # Distillation loss.
+            rng, noise_rng = jax.random.split(rng)
+            noises = jax.random.normal(noise_rng, (batch_size, action_dim))
+            target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
+            actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
+            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
-        # Q loss.
-        actor_actions = jnp.clip(actor_actions, -1, 1)
-        qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
-        q = jnp.mean(qs, axis=0)
+            # Q loss.
+            actor_actions = jnp.clip(actor_actions, -1, 1)
+            qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
+            q = jnp.mean(qs, axis=0)
 
-        q_loss = -q.mean()
-        if self.config['normalize_q_loss']:
-            lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
-            q_loss = lam * q_loss
+            q_loss = -q.mean()
+            if self.config['normalize_q_loss']:
+                lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
+                q_loss = lam * q_loss
+        else:
+            distill_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            q_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            q = jnp.asarray(0.0, dtype=jnp.float32)
 
         # Total loss.
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
         # Additional metrics for logging.
-        actions = self.sample_actions(batch['observations'], seed=rng)
-        mse = jnp.mean((actions - batch['actions']) ** 2)
+        if self.config['use_distill_head']:
+            actions = self.sample_actions(batch['observations'], seed=rng)
+            mse = jnp.mean((actions - batch['actions']) ** 2)
+        else:
+            mse = jnp.asarray(0.0, dtype=jnp.float32)
 
         return actor_loss, {
             'actor_loss': actor_loss,
@@ -264,6 +272,7 @@ def get_config():
             alpha=10.0,  # BC coefficient (need to be tuned for each environment).
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
+            use_distill_head=True,  # Whether to train/use the distilled one-step head in the actor loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
         )
     )

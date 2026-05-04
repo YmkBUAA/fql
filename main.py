@@ -70,6 +70,10 @@ def main(_):
             exp_tags.append(f"t{format_exp_value(lo)}")
         else:
             exp_tags.append(f"t{format_exp_value(lo)}-{format_exp_value(hi)}")
+    if 'adv_t_dist' in config and config['adv_t_dist'] != 'uniform':
+        exp_tags.append(f"tdist{config['adv_t_dist']}")
+    if 'weighted_bc_online_only' in config:
+        exp_tags.append('woT' if config['weighted_bc_online_only'] else 'woF')
     exp_suffix = '_' + '_'.join(exp_tags) if exp_tags else ''
     exp_name = config.agent_name + exp_suffix + '_' + get_exp_name(FLAGS.seed) + '_' + FLAGS.env_name
     setup_wandb(project='fql', group=FLAGS.run_group, name=exp_name)

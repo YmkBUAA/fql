@@ -127,6 +127,22 @@ class FQLARAgent(flax.struct.PyTreeNode):
             x = x + vels * dt
         return jnp.clip(x, -1, 1)
 
+    def _sample_adv_t(self, rng, shape):
+        """Sample FlowAR advantage-path t according to the configured schedule."""
+        lo = self.config['adv_t_lo']
+        hi = self.config['adv_t_hi']
+        dist = self.config.get('adv_t_dist', 'uniform')
+        if dist == 'uniform':
+            t_unit = jax.random.uniform(rng, shape)
+        elif dist == 'triangular':
+            u = jax.random.uniform(rng, shape)
+            t_unit = jnp.where(u < 0.5, jnp.sqrt(u / 2.0), 1.0 - jnp.sqrt((1.0 - u) / 2.0))
+        elif dist == 'beta22':
+            t_unit = jax.random.beta(rng, 2.0, 2.0, shape=shape)
+        else:
+            raise ValueError(f"Unknown adv_t_dist: {dist}")
+        return lo + (hi - lo) * t_unit
+
     def actor_loss(self, batch, grad_params, rng, online):
         """FlowAR actor loss = Delta-weighted BC flow + distill + Q."""
         batch_size, action_dim = batch['actions'].shape
@@ -135,11 +151,7 @@ class FQLARAgent(flax.struct.PyTreeNode):
         # ----- Branch A: advantage via self-denoise -------------------------
         rng, eps_rng, t_rng = jax.random.split(rng, 3)
         eps_adv = jax.random.normal(eps_rng, (batch_size, action_dim))
-        t_adv = jax.random.uniform(
-            t_rng, (batch_size, 1),
-            minval=self.config['adv_t_lo'],
-            maxval=self.config['adv_t_hi'],
-        )
+        t_adv = self._sample_adv_t(t_rng, (batch_size, 1))
         x_t_adv = (1.0 - t_adv) * eps_adv + t_adv * a
         a_prime = self._roll_flow_from(
             batch['observations'], x_t_adv, t_adv,
@@ -215,31 +227,39 @@ class FQLARAgent(flax.struct.PyTreeNode):
         per_time_bc = jnp.mean((pred - target_vel) ** 2, axis=-1)
         bc_flow_loss = jnp.mean(bc_weights[:, None] * per_time_bc)
 
-        # ----- Distillation + Q loss (unchanged from FQL) ------------------
-        rng, noise_rng = jax.random.split(rng)
-        noises = jax.random.normal(noise_rng, (batch_size, action_dim))
-        target_flow_actions = self.compute_flow_actions(
-            batch['observations'], noises=noises
-        )
-        actor_actions = self.network.select('actor_onestep_flow')(
-            batch['observations'], noises, params=grad_params
-        )
-        distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+        if self.config['use_distill_head']:
+            # ----- Distillation + Q loss (unchanged from FQL) --------------
+            rng, noise_rng = jax.random.split(rng)
+            noises = jax.random.normal(noise_rng, (batch_size, action_dim))
+            target_flow_actions = self.compute_flow_actions(
+                batch['observations'], noises=noises
+            )
+            actor_actions = self.network.select('actor_onestep_flow')(
+                batch['observations'], noises, params=grad_params
+            )
+            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
-        actor_actions_clip = jnp.clip(actor_actions, -1, 1)
-        qs = self.network.select('critic')(batch['observations'], actions=actor_actions_clip)
-        q = jnp.mean(qs, axis=0)
+            actor_actions_clip = jnp.clip(actor_actions, -1, 1)
+            qs = self.network.select('critic')(batch['observations'], actions=actor_actions_clip)
+            q = jnp.mean(qs, axis=0)
 
-        q_loss = -q.mean()
-        if self.config['normalize_q_loss']:
-            lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
-            q_loss = lam * q_loss
+            q_loss = -q.mean()
+            if self.config['normalize_q_loss']:
+                lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
+                q_loss = lam * q_loss
+        else:
+            distill_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            q_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            q = jnp.asarray(0.0, dtype=jnp.float32)
 
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
         # ----- Diagnostics --------------------------------------------------
-        actions = self.sample_actions(batch['observations'], seed=rng)
-        mse = jnp.mean((actions - batch['actions']) ** 2)
+        if self.config['use_distill_head']:
+            actions = self.sample_actions(batch['observations'], seed=rng)
+            mse = jnp.mean((actions - batch['actions']) ** 2)
+        else:
+            mse = jnp.asarray(0.0, dtype=jnp.float32)
         dist_a_aprime = jnp.linalg.norm(a - a_prime, axis=-1)
         frac_a_better = jnp.mean((delta > 0).astype(jnp.float32))
 
@@ -447,12 +467,14 @@ def get_config():
             alpha=10.0,
             flow_steps=10,
             normalize_q_loss=False,
+            use_distill_head=True,
             encoder=ml_collections.config_dict.placeholder(str),
             # ---- BC flow CFM samples per state (independent of advantage path) ----
             n_actor_time_samples=1,
             # ---- FlowAR advantage path ----
             adv_t_lo=0.4,           # lower bound on noise level for advantage path
             adv_t_hi=0.7,           # upper bound on noise level for advantage path
+            adv_t_dist='uniform',   # uniform, triangular, or beta22
             adv_flow_steps=3,       # Euler steps for partial denoising back to t=1
             # ---- ESS-targeted reweighting ----
             ess_target=0.7,

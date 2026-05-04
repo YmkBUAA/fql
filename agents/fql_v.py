@@ -52,7 +52,7 @@ class FQLVAgent(flax.struct.PyTreeNode):
         }
 
     def value_loss(self, batch, grad_params, rng):
-        """Train V(s) toward E_a[Q(s, a)] under the current BC flow policy."""
+        """Train V(s) toward E_a[Q(s, a)] under the configured actor sampler."""
         batch_size, action_dim = batch['actions'].shape
         n = self.config['n_v_samples']
 
@@ -64,7 +64,10 @@ class FQLVAgent(flax.struct.PyTreeNode):
         obs_flat = obs_exp.reshape((batch_size * n,) + obs_tail)
         noises_flat = noises.reshape(batch_size * n, action_dim)
 
-        a_samples_flat = self.network.select('actor_onestep_flow')(obs_flat, noises_flat)
+        if self.config['v_baseline_source'] == 'bc_flow':
+            a_samples_flat = self.compute_flow_actions(obs_flat, noises_flat)
+        else:
+            a_samples_flat = self.network.select('actor_onestep_flow')(obs_flat, noises_flat)
         a_samples_flat = jnp.clip(a_samples_flat, -1, 1)
         a_samples_flat = jax.lax.stop_gradient(a_samples_flat)
 
@@ -85,6 +88,10 @@ class FQLVAgent(flax.struct.PyTreeNode):
             'v_pred_mean': v_pred.mean(),
             'v_target_mean': v_target.mean(),
             'v_target_std': v_target.std(),
+            'v_baseline_source_bc_flow': jnp.asarray(
+                1.0 if self.config['v_baseline_source'] == 'bc_flow' else 0.0,
+                dtype=jnp.float32,
+            ),
         }
 
     @staticmethod
@@ -184,29 +191,37 @@ class FQLVAgent(flax.struct.PyTreeNode):
         per_time_bc = jnp.mean((pred - vel) ** 2, axis=-1)
         bc_flow_loss = jnp.mean(bc_weights[:, None] * per_time_bc)
 
-        # Distillation loss.
-        rng, noise_rng = jax.random.split(rng)
-        noises = jax.random.normal(noise_rng, (batch_size, action_dim))
-        target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
-        actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
-        distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+        if self.config['use_distill_head']:
+            # Distillation loss.
+            rng, noise_rng = jax.random.split(rng)
+            noises = jax.random.normal(noise_rng, (batch_size, action_dim))
+            target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
+            actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
+            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
-        # Q loss.
-        actor_actions = jnp.clip(actor_actions, -1, 1)
-        qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
-        q = jnp.mean(qs, axis=0)
+            # Q loss.
+            actor_actions = jnp.clip(actor_actions, -1, 1)
+            qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
+            q = jnp.mean(qs, axis=0)
 
-        q_loss = -q.mean()
-        if self.config['normalize_q_loss']:
-            lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
-            q_loss = lam * q_loss
+            q_loss = -q.mean()
+            if self.config['normalize_q_loss']:
+                lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
+                q_loss = lam * q_loss
+        else:
+            distill_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            q_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            q = jnp.asarray(0.0, dtype=jnp.float32)
 
         # Total loss.
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
         # Additional metrics for logging.
-        actions = self.sample_actions(batch['observations'], seed=rng)
-        mse = jnp.mean((actions - batch['actions']) ** 2)
+        if self.config['use_distill_head']:
+            actions = self.sample_actions(batch['observations'], seed=rng)
+            mse = jnp.mean((actions - batch['actions']) ** 2)
+        else:
+            mse = jnp.asarray(0.0, dtype=jnp.float32)
 
         return actor_loss, {
             'actor_loss': actor_loss,
@@ -450,9 +465,11 @@ def get_config():
             alpha=10.0,  # BC coefficient (need to be tuned for each environment).
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
+            use_distill_head=True,  # Whether to train/use the distilled one-step head in the actor loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             n_actor_time_samples=4,
             n_v_samples=8,
+            v_baseline_source='onestep',  # 'onestep' (legacy) or 'bc_flow'.
             value_loss_weight=1.0,
             ess_target=0.7,
             weighted_bc_online_only=True,  # If True, value weighting is active only during the online stage.
