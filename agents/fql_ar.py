@@ -137,6 +137,16 @@ class FQLARAgent(flax.struct.PyTreeNode):
         elif dist == 'triangular':
             u = jax.random.uniform(rng, shape)
             t_unit = jnp.where(u < 0.5, jnp.sqrt(u / 2.0), 1.0 - jnp.sqrt((1.0 - u) / 2.0))
+        elif dist == 'raised_triangular':
+            # Density: q(t)=0.1+1.8t for t<=0.5, q(t)=2(1-t) for t>0.5.
+            u = jax.random.uniform(rng, shape)
+            total_area = 0.525
+            left_area = 0.275
+            area = u * total_area
+            t_left = (-0.1 + jnp.sqrt(0.01 + 3.6 * area)) / 1.8
+            y = area - left_area + 0.75
+            t_right = 1.0 - jnp.sqrt(1.0 - y)
+            t_unit = jnp.where(area <= left_area, t_left, t_right)
         elif dist == 'beta22':
             t_unit = jax.random.beta(rng, 2.0, 2.0, shape=shape)
         else:
@@ -474,7 +484,7 @@ def get_config():
             # ---- FlowAR advantage path ----
             adv_t_lo=0.4,           # lower bound on noise level for advantage path
             adv_t_hi=0.7,           # upper bound on noise level for advantage path
-            adv_t_dist='uniform',   # uniform, triangular, or beta22
+            adv_t_dist='uniform',   # uniform, triangular, raised_triangular, or beta22
             adv_flow_steps=3,       # Euler steps for partial denoising back to t=1
             # ---- ESS-targeted reweighting ----
             ess_target=0.7,

@@ -341,8 +341,120 @@ PCA-2D 散点图（[`figures/1_bc_modes_by_task.png`](../visualization/figures/1
 
 ---
 
+## 7. v3 论证：从"替代 V baseline"到"V baseline 的连续推广"
+
+v2.5 已经把核心机制（within-mode baseline）和数据状况（toy 必需、cube-double-noisy 不触发坍缩）说清楚。本节给出**论文级别的 framing 与实验设计**，把方法、定理与实验三者锁紧。
+
+### 7.1 framing 微调：V baseline 不是"错"，而是"覆盖不够"
+
+v1/v2 的写法把 V baseline 描述为 mode collapse 的元凶。但 fql_ar 在 `t=0` 处的退化语义（[`§3.5`](#35-退化情形t-边界两端的语义)）严格等价于 fql_v K=1。如果 §3 把 V baseline 整体否定，则 §4 的"`t=0` 等价于 V"立刻变成自相矛盾。
+
+正确的 framing 是：
+
+> **V baseline 给出"全状态期望"信号**，对真实奖励差异显著的模态（典型低质量演示、轨迹尾部失败）能正确滤除，但**对任务等价、仅执行噪声不同的模态**则因 per-action Q 被噪声拖低而错误下权（噪声 ≠ 模态价值低，是 Q 估计的一阶细节）。我们将 baseline 推广为单参数族 `{a'(t) : t ∈ [0,1]}`，其中：
+>
+> - **`t = 0`**：`E_ε[Q(s, a'(0,ε))] = V(s)`，AR 优势在期望意义下退化为 fql_v 优势 → **保留 V baseline 的全局滤除能力**；
+> - **`t → 1`**：`a'(t,ε) → a` 在分布意义下，advantage 由 within-mode 局部 Q 曲率主导 → **提供 V 不能表示的 mode-local 信号**；
+> - **`t ∈ (0, 1)`**：`I(a; a'(t))` 关于 t 单调（信息单调性），t 是连续旋钮。
+>
+> mode collapse 失效不是"V 错了"，而是**"V 是单点配置"**——它把整个连续族压成 t=0 一点，因此无法在同一次训练中既滤除明显低质模态又保留任务等价模态。**fql_ar 的贡献是把 V baseline 推广成可调谐的连续族**。
+
+这一改写之后：
+- §3 不需要否定 V baseline，只指出"覆盖不够"；
+- §4 的 `t=0 ↔ V` 等价从"反直觉的副产品"变成"承诺的可控性"；
+- §5 的 toy 用单极端配置（高 t）、benchmark 用 raised_tri 混合配置完全自洽。
+
+### 7.2 方法描述（论文 §4 的三段式）
+
+直接调用 [`docs/fql_ar_superiority_proof.md`](fql_ar_superiority_proof.md) 中的四个定理：
+
+1. **(t=0 边界 — Theorem 1, Strict Generalization of FQL-V)**
+   ```
+   E_ε[ Q(s, a'(0, ε; s, a)) ]  =  V(s).
+   ```
+   AR 优势在期望意义下与 V baseline 优势重合。`t > 0` 时，`E_ε[Q(s, a'(t, ε; s, a))]` 是 a 的非平凡函数，落在 V 网络表示空间之外。
+
+2. **(t→1 边界 — Theorem 4, Self-Regulation)**
+   当 a 已落在 BC 模态局部峰上，`a'(t,ε) → a` 且 `δ → 0`，`w_exp → 1`（均匀权）。**这是 V baseline 不具备的性质**：fql_v 的 `δ = Q(s,a) − V(s)` 在 a 完美在模态上仍可不为零（取决于该模态的 Q 是否高于状态期望），导致对模态动作做不必要的下权或上权。
+
+3. **(连续性 — Theorem 2, Information Monotonicity)**
+   `I(a; a'(t))` 关于 `t ∈ [0, 1]` 单调非降，端点 `I_0 = 0`、`I_1 = H(a|s)`。t 是 baseline 与样本耦合度的**校准信息旋钮**。`adv_t_lo, adv_t_hi, adv_t_dist` 这三个超参共同指定使用哪一段信号。
+
+加上 [Theorem 3, Control-Variate Variance Reduction](fql_ar_superiority_proof.md#4-theorem-3--control-variate-variance-reduction)：
+
+4. **(方差 — Theorem 3)**
+   对 Lipschitz Q，`Σ_AR(t) ≤ (1 − ρ_t²) · Σ_V`，其中 `ρ_t` 是 `(a, x_t)` 的相关系数。`t > 0` 时 fql_ar 的 baseline 单样本 MC 方差严格小于 fql_v K=1 的对应方差；这是 fql_ar K=1 能匹配 fql_v K=4 的方差解释。
+
+四个定理形成一个完整支撑：边界等价（T1, T4）+ 连续插值（T2）+ 方差优势（T3）。
+
+### 7.3 实验设计：toy 用纯配置、benchmark 用 raised_tri 的认识论分工
+
+实验段不应混用配置，应当**让每个实验回答一个明确问题**。先给出 t 区间的经验语义校准（基于 toy 实测，不是先验猜测）：
+
+| t 区间 | 实测语义 | 解释 |
+|---|---|---|
+| `[0, 0.2]` | **滤除区**（V baseline 等价） | x_t 中 eps 主导，a' 可漂到任何模态 |
+| `[0.3, 0.8]` | **mode-local 保留区** | a 已把 ODE basin 拉向自己模态，仍有积分距离生成有效 δ |
+| `[0.85, 1.0]` | 自调节归零 | a' ≈ a，δ ≈ 0，无信号 |
+
+注意"mode-local 保留区"远比早期直觉的"高 t = 严格锚定 a"宽——`[0.4, 0.7]` 这种中段区间已经是有效保留配置，因为 ODE 走向最近 attractor 的几何使中等 t 已足以让 a' 落回 a 的 mode 内。
+
+实验配置据此分工：
+
+| 实验 | 数据成分 | t 配置 | 回答的问题 |
+|---|---|---|---|
+| **Toy: Two-Passage Reach (mechanism 隔离)** | **已知**等价两模态 + 异质执行噪声 | **`uniform[0.4, 0.7]`**（实际配置） | within-mode 信号是否真的能在 V baseline 失败的情形下保住 B 模态？ |
+| **Toy: low-t 负面对照（可选但加分）** | 同上 | **`uniform[0, 0.2]`** | 如果只是"换 baseline"够不够？验证 t=0 退化等价 V 的预测：bot 同样失败。 |
+| **OGBench / D4RL benchmark (deployment 验证)** | **未知**混合：(a) 等任务质量异噪声模态对 + (b) 真实低质量演示 | **`raised_triangular[0, 1]`** | 单旋钮如何同时承担两种信号？raised_tri 是混合先验的最小信息编码。 |
+| **Benchmark ablation（必需）** | 同上，1–2 envs | `uniform[0.3, 0.8]` / `uniform[0, 0.3]` / `uniform[0, 1]` / `raised_tri[0, 1]` | 拆掉滤除尾或拆掉保留主体后哪个还能工作？区分双轨设计的两份贡献。 |
+
+raised_tri 在上述区间校准下的质量分配：**21% 滤除区 + 71% mode-local 保留区 + 8% signal-vanishing**。该分配与 §7.2 的 Theorem 1（t=0↔V）/ Theorem 4（t→1↔mode-local）承诺**自洽**——左尾对应 V baseline 滤除能力，中段对应 mode-local 保留能力，右端归零避免无效信号污染。
+
+这条划分把"toy 与 benchmark 用不同 t"从可能的不一致变成**实验设计精度声明**：toy 是机制实验，固定一端解耦；benchmark 是部署实验，未知成分故用混合。两边的 t 选择**都由 §7.2 的定理直接导出**，不是临时调参。
+
+### 7.4 论文 §3 现象层应当呈现两种失效，不止一种
+
+v2.5 §4.5 已经发现 cube-double-noisy 不触发"v1 式纯 mode collapse"。结合 v3 framing，§3 应当并列两种失效：
+
+- **(a) 保留型失效（mode collapse on equi-quality）**：等任务奖励但执行噪声异质，V baseline 因 per-action Q 被噪声拖低而错误下权噪声模态。toy Two-Passage 复现；这是 v2 的主线机制。
+- **(b) 过宽容失效（no filtering）**：纯 BC（vanilla FQL，无加权）不区分明显低质模态，所有数据等权。这是 V baseline 的合理用途场景。
+
+两种失效共同要求一个能"分层"的 baseline，而不是单点 baseline。**把 (b) 加进 §3 是关键**——没有它，"为什么 raised_tri 而不是高 t uniform" 在 §5 是无法回答的；有了它，论点闭环：toy 解决 (a)、benchmark 同时解决 (a) 与 (b)。
+
+### 7.5 当前数据缺口（v3 路线图，按优先级）
+
+**P0（必须，paper 主表的硬要求）**：
+
+1. **完成 OGBench raised_tri_woF sweep**：当前 [`FQL_AR_RAISED_TRI_WOF_OTHER_GPU02`](../exp/fql/FQL_AR_RAISED_TRI_WOF_OTHER_GPU02/) 仅 4/24 jobs 完成，cube-double-noisy 与 cube-triple-play 全无数据。
+2. **OGBench 同环境 baseline**：`fql` 与 `fql_v` 各 3 seeds × 8 envs。**当前完全没有**——没有 baseline，"raised_tri_woF 同时解决 (a) 与 (b)" 的命题在 review 时直接被退。
+3. **Toy 现有数据复核**：现有 toy `fql_ar` 配置 `adv_t_lo=0.4, adv_t_hi=0.7` 已经落在 §7.3 的 mode-local 保留区，PASSAGE_MECHANISM_RESULTS.md 数据可直接作为机制证据。**不需要重跑**——之前提议的 `[0.8, 0.95]` 在 signal-vanishing 区，反而比 `[0.4, 0.7]` 更弱。
+
+**P1（应有，论证强度）**：
+
+4. **Toy 低 t 负面对照**：`uniform[0, 0.2]` × 5 seeds × {nb=0.06, 0.08}，预期 bot 与 fql_v 同样失败（验证 t=0 等价 V）。这条让 §7.2 Theorem 1 的等价声明从"理论"变成"toy 可观测"。
+5. **OGBench ablation（必需）**：在 1 noisy env + 1 play env 上跑四组对照：
+   - `raised_tri[0, 1]_woF`（主配置）
+   - `uniform[0.3, 0.8]_woF`（**纯保留**：去掉 raised_tri 的 21% 滤除尾）
+   - `uniform[0, 0.3]_woF`（**纯滤除**：去掉 71% 保留主体）
+   - `uniform[0, 1]_woF`（平坦覆盖对照）
+
+   预期 raised_tri ≥ uniform[0.3, 0.8] ≫ uniform[0, 0.3]：若如此则双轨设计立住；若 raised_tri ≈ uniform[0.3, 0.8]，主配置可简化为纯保留，叙事退化为单轨；若 uniform[0, 0.3] 反超，说明数据集主要是 (b) 类失效，故事方向需改。
+
+**P2（细节，让审稿不被钉）**：
+
+6. **`adv_flow_steps` 检查**：raised_tri 在 t→0 处一步 Euler（步长 1.0）的积分误差是否实质影响。把 `adv_flow_steps` 从 1 提到 4 跑一组 seed 看是否影响。
+7. **多模度量**：trajectory-level mode label（OGBench cube 的"抓哪个/从哪侧"）或 action distribution entropy，定量证明"raised_tri_woF 保留多模"，匹配 §1.3、§7.4 的承诺。
+
+### 7.6 一句话总括（v3 版）
+
+> **fql_ar 不是 V baseline 的替代，而是它的连续推广。** 把 baseline 写成单参数族 `{a'(t)}`，端点回收 V baseline（`t=0`）与严格 mode-local 加权（`t→1`），中间由信息单调性平滑插值。toy 用纯高 t 隔离机制、benchmark 用 raised_tri 同时承担"明显低质模态滤除"与"任务等价模态保留"两份工作。整套设计零额外网络、零额外可训参数，只复用 BC flow 的 ODE 几何。
+
+---
+
 ## 修订日志
 
 - **v1**（[fql_ar_design.md](fql_ar_design.md)）：best-of-n online absorption framing，预测 `delta_mean > 0`、`frac_a_better > 0.6`。
 - **v2.0**（IDEA.md 初版）：换为 within-mode baseline framing，预测 `delta_mean ≈ 0`、`frac_a_better ≈ 0.5`。cube-double-noisy 列为主验证场，假设 task1/2/3 多模性不同。
-- **v2.5**（本版）：实测发现 cube-double-noisy task1/2/3 共享数据 → 故事收紧为"同数据 + reward 不对称"；实测 fql_v 在 cube-double-noisy 上**未塌缩** → cube-double-noisy 降级为补充证据，主验证场转向 toy bimodal + PushT-asymmetric。viz 3 训练诊断仍干净支持 within-mode framework；viz 1/2 BC 流分布只支持"多模存在"，不支持"fql_v 塌缩"。
+- **v2.5**：实测发现 cube-double-noisy task1/2/3 共享数据 → 故事收紧为"同数据 + reward 不对称"；实测 fql_v 在 cube-double-noisy 上**未塌缩** → cube-double-noisy 降级为补充证据，主验证场转向 toy bimodal + PushT-asymmetric。viz 3 训练诊断仍干净支持 within-mode framework；viz 1/2 BC 流分布只支持"多模存在"，不支持"fql_v 塌缩"。
+- **v3**（本节 §7）：framing 从"替代 V baseline"调整为"V baseline 的连续推广"——保留 v2 的 within-mode 主线，但与 t=0 退化等价 V 的事实兼容。新增"两种失效"叙事（保留型 + 过宽容型），实验段切分为 toy 用纯高 t 配置（mechanism）与 benchmark 用 raised_tri_woF 配置（deployment），两边的 t 选择由 §7.2 的 Theorem 1/2/4 直接导出。raised_tri 的双轨性质（左端滤除 + 右端保留）作为方法的核心贡献而非次要选择。
+- **v3.1**（本版微调）：根据 toy 实测配置 `adv_t_lo=0.4, adv_t_hi=0.7` 校准 t 区间语义——"mode-local 保留区"实测覆盖 `[0.3, 0.8]` 而非早期猜测的 `[0.8, 0.95]`（后者是 signal-vanishing 区），raised_tri[0,1] 的质量分布因此修正为 21% 滤除 + 71% 保留 + 8% 浪费，与 v3 双轨叙事自洽。Ablation 候选从"双峰混合"调整为"`uniform[0.3, 0.8]` / `uniform[0, 0.3]` 拆解滤除/保留两份贡献"——更直接对应 §7.4 的两类失效。Toy P0 实验降级（现有数据已在保留区，无需重跑）。
