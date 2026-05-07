@@ -472,7 +472,7 @@ def get_config():
             v_baseline_source='onestep',  # 'onestep' (legacy) or 'bc_flow'.
             value_loss_weight=1.0,
             ess_target=0.7,
-            weighted_bc_online_only=True,  # If True, value weighting is active only during the online stage.
+            weighted_bc_online_only=False,  # If True, value weighting is active only during the online stage.
             r2_critic_target=0.5,
             gate_kappa_critic=0.05,
             gate_ema_decay=0.999,
