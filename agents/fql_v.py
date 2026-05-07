@@ -468,7 +468,7 @@ def get_config():
             use_distill_head=True,  # Whether to train/use the distilled one-step head in the actor loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             n_actor_time_samples=1,
-            n_v_samples=1,
+            n_v_samples=8,
             v_baseline_source='onestep',  # 'onestep' (legacy) or 'bc_flow'.
             value_loss_weight=1.0,
             ess_target=0.7,
