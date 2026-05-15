@@ -6,6 +6,7 @@ import random
 import time
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import tqdm
 import wandb
@@ -14,6 +15,7 @@ from ml_collections import config_flags
 
 from agents import agents
 from envs.env_utils import make_env_and_datasets
+from envs import maniskill_utils
 from utils.datasets import Dataset, ReplayBuffer
 from utils.evaluation import evaluate, flatten
 from utils.flax_utils import restore_agent, save_agent
@@ -42,6 +44,12 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
 flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
+flags.DEFINE_string('eval_extra_env_names', '', 'Comma-separated extra env names to evaluate.')
+flags.DEFINE_integer('action_diag_states', 128, 'Number of fixed dataset states for action-mode diagnostics.')
+flags.DEFINE_integer('action_diag_samples', 32, 'Number of policy samples per state for action-mode diagnostics.')
+flags.DEFINE_integer('action_diag_axis', 0, 'Action dimension used for left/right PushT mode diagnostics.')
+flags.DEFINE_float('action_diag_threshold', 0.05, 'Dead-zone threshold for action-mode diagnostics.')
+flags.DEFINE_bool('save_action_samples', True, 'Whether to save action samples from diagnostics as NPZ files.')
 
 config_flags.DEFINE_config_file('agent', 'agents/nfql.py', lock_config=False)
 
@@ -49,6 +57,52 @@ config_flags.DEFINE_config_file('agent', 'agents/nfql.py', lock_config=False)
 # BC on/off across the offline→online boundary. Adding a new agent here is the
 # only place that needs touching.
 ONLINE_AWARE_AGENTS = ('fql_v', 'nfql', 'nfql_6', 'nfql_7', 'nfql_8', 'fql_ar', 'fql_pi')
+
+
+def action_mode_diagnostics(agent, observations, step, save_dir=None):
+    """Sample policy actions on fixed states and summarize left/right modes."""
+    if observations is None or FLAGS.action_diag_samples <= 0:
+        return {}
+    rng = jax.random.PRNGKey(FLAGS.seed + int(step) + 17)
+    sampled = []
+    for _ in range(FLAGS.action_diag_samples):
+        rng, key = jax.random.split(rng)
+        actions = agent.sample_actions(observations=observations, temperature=1, seed=key)
+        sampled.append(np.array(actions))
+    actions = np.stack(sampled, axis=0)
+
+    axis = min(FLAGS.action_diag_axis, actions.shape[-1] - 1)
+    coord = actions[..., axis]
+    left = coord < -FLAGS.action_diag_threshold
+    right = coord > FLAGS.action_diag_threshold
+    neutral = ~(left | right)
+    p_left = float(left.mean())
+    p_right = float(right.mean())
+    p_neutral = float(neutral.mean())
+    probs = np.asarray([p_left, p_right, p_neutral], dtype=np.float64)
+    entropy = float(-(probs[probs > 0] * np.log(probs[probs > 0])).sum() / np.log(3.0))
+    coverage = float((p_left > 0.05) + (p_right > 0.05))
+    balance = float(min(p_left, p_right) / max(p_left, p_right, 1e-8))
+
+    if save_dir is not None and FLAGS.save_action_samples:
+        sample_dir = os.path.join(save_dir, 'action_samples')
+        os.makedirs(sample_dir, exist_ok=True)
+        np.savez_compressed(
+            os.path.join(sample_dir, f'step_{step:08d}.npz'),
+            observations=np.array(observations),
+            actions=actions,
+            axis=np.asarray(axis),
+            threshold=np.asarray(FLAGS.action_diag_threshold),
+        )
+
+    return {
+        'action_modes/left_ratio': p_left,
+        'action_modes/right_ratio': p_right,
+        'action_modes/neutral_ratio': p_neutral,
+        'action_modes/mode_entropy': entropy,
+        'action_modes/mode_coverage': coverage,
+        'action_modes/lr_balance': balance,
+    }
 
 
 def main(_):
@@ -86,6 +140,13 @@ def main(_):
 
     # Make environment and datasets.
     env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack)
+    extra_eval_envs = {}
+    if FLAGS.eval_extra_env_names:
+        for extra_env_name in [x.strip() for x in FLAGS.eval_extra_env_names.split(',') if x.strip()]:
+            if extra_env_name in maniskill_utils.PUSHT_ENV_KEYS:
+                extra_eval_envs[extra_env_name] = maniskill_utils.make_pusht_env(extra_env_name)
+            else:
+                extra_eval_envs[extra_env_name] = make_env_and_datasets(extra_env_name, frame_stack=FLAGS.frame_stack)[1]
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
     if FLAGS.online_steps > 0:
@@ -97,6 +158,11 @@ def main(_):
 
     # Set up datasets.
     train_dataset = Dataset.create(**train_dataset)
+    action_diag_observations = None
+    if FLAGS.action_diag_states > 0:
+        n_diag = min(FLAGS.action_diag_states, train_dataset.size)
+        diag_idxs = np.linspace(0, train_dataset.size - 1, num=n_diag, dtype=np.int64)
+        action_diag_observations = jnp.asarray(train_dataset.get_subset(diag_idxs)['observations'])
     if FLAGS.balanced_sampling:
         # Create a separate replay buffer so that we can sample from both the training dataset and the replay buffer.
         example_transition = {k: v[0] for k, v in train_dataset.items()}
@@ -230,6 +296,22 @@ def main(_):
             renders.extend(cur_renders)
             for k, v in eval_info.items():
                 eval_metrics[f'evaluation/{k}'] = v
+
+            for extra_name, extra_env in extra_eval_envs.items():
+                extra_info, _, _ = evaluate(
+                    agent=agent,
+                    env=extra_env,
+                    config=config,
+                    num_eval_episodes=FLAGS.eval_episodes,
+                    num_video_episodes=0,
+                    video_frame_skip=FLAGS.video_frame_skip,
+                )
+                prefix = f'evaluation_extra/{extra_name}'
+                for k, v in extra_info.items():
+                    eval_metrics[f'{prefix}/{k}'] = v
+
+            if 'pusht' in FLAGS.env_name:
+                eval_metrics.update(action_mode_diagnostics(agent, action_diag_observations, i, FLAGS.save_dir))
 
             if FLAGS.video_episodes > 0:
                 video = get_wandb_video(renders=renders)

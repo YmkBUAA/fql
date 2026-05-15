@@ -47,6 +47,68 @@ python main.py --env_name=visual-cube-single-play-singletask-task1-v0 --offline_
 python main.py --env_name=scene-play-singletask-v0 --online_steps=1000000 --agent.alpha=300
 ```
 
+## ManiSkill PushT offline-to-online experiments
+
+This fork includes an experimental ManiSkill PushT pipeline for testing
+whether flow policies preserve multi-modal action distributions during
+offline-to-online fine-tuning. The first version uses state observations
+from ManiSkill `PushT-v1` and focuses on action modes such as left-push vs
+right-push, not RGB/state sensor fusion.
+
+Install the extra dependencies from `requirements.txt`:
+```bash
+pip install -r requirements.txt
+```
+
+Prepare the PushT demonstrations from
+`haosulab/ManiSkill_Demonstrations`:
+```bash
+python scripts/prepare_maniskill_pusht_data.py
+```
+
+The data preparation script downloads
+`demos/PushT-v1/rl/trajectory.none.pd_ee_delta_pos.physx_cuda.h5` and replays
+it with ManiSkill state observations and dense normalized rewards. It defaults
+to `--sim-backend=physx_cpu` so the replay does not require a CUDA-compatible
+PyTorch/driver pair. Use `--sim-backend=physx_cuda` only if your driver and
+PyTorch build support it. By default the training code expects the converted
+trajectory at:
+```bash
+data/maniskill/PushT-v1/trajectory.state.pd_ee_delta_pos.physx_cuda.h5
+```
+
+If ManiSkill writes a different filename, point the loader to it explicitly:
+```bash
+export MANISKILL_PUSHT_H5=/path/to/converted_trajectory.h5
+export MANISKILL_PUSHT_JSON=/path/to/converted_trajectory.json
+```
+
+Run a quick launch check:
+```bash
+bash scripts/run_exp_maniskill_pusht_o2o_multimodal.sh dryrun
+```
+
+Launch the default sweep:
+```bash
+bash scripts/run_exp_maniskill_pusht_o2o_multimodal.sh
+```
+
+The default sweep trains on `maniskill-pusht-state-v1`, evaluates on both
+standard PushT and `maniskill-pusht-asym-state-v1`, and runs:
+`fql`, `fql_v_k1`, `fql_v_k4`, `fql_ar`, and `fql_pi` across seeds `0 1 2`.
+The asymmetric environment is an action/reward-level stress test that blocks
+one action side by default. Override it with:
+```bash
+PUSHT_ASYM_BLOCKED_SIDE=right PUSHT_ASYM_PENALTY=0.1 \
+    bash scripts/run_exp_maniskill_pusht_o2o_multimodal.sh
+```
+
+PushT runs log additional action-mode diagnostics at evaluation checkpoints:
+`action_modes/left_ratio`, `action_modes/right_ratio`,
+`action_modes/mode_entropy`, `action_modes/mode_coverage`, and
+`action_modes/lr_balance`. The sampled actions are also saved under each run's
+`action_samples/` directory unless `--save_action_samples=False` is passed.
+
 ## Tips for hyperparameter tuning
 
 Here are some general tips for FQL's hyperparameter tuning for new tasks:

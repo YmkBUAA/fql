@@ -1,6 +1,11 @@
 import collections
+import os
 import re
 import time
+
+from envs.gymnasium_utils import patch_gymnasium_plugin_autoload
+
+patch_gymnasium_plugin_autoload()
 
 import gymnasium
 import numpy as np
@@ -8,6 +13,7 @@ import ogbench
 from gymnasium.spaces import Box
 
 from utils.datasets import Dataset
+from envs import maniskill_utils
 
 
 class EpisodeMonitor(gymnasium.Wrapper):
@@ -100,7 +106,18 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
         A tuple of the environment, evaluation environment, training dataset, and validation dataset.
     """
 
-    if 'singletask' in env_name:
+    if env_name in maniskill_utils.PUSHT_ENV_KEYS:
+        env = maniskill_utils.make_pusht_env(env_name)
+        eval_env = maniskill_utils.make_pusht_env(env_name)
+        h5_path, json_path = maniskill_utils.get_pusht_dataset_paths()
+        train_dataset = maniskill_utils.load_pusht_dataset(
+            h5_path,
+            json_path=json_path,
+            only_success=os.environ.get('MANISKILL_PUSHT_ONLY_SUCCESS', '1') != '0',
+        )
+        train_dataset = Dataset.create(**train_dataset)
+        val_dataset = None
+    elif 'singletask' in env_name:
         # OGBench.
         env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
         eval_env = ogbench.make_env_and_datasets(env_name, env_only=True)
